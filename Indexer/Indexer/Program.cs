@@ -11,8 +11,6 @@ namespace Indexer
 {
     class Program
     {
-        private static SearchIndexClient _indexClient;
-        private static SearchClient _searchClient;
         static IConfigurationBuilder builder = new ConfigurationBuilder().AddJsonFile("appsettings.json");
         static IConfigurationRoot configuration = builder.Build();
 
@@ -37,6 +35,10 @@ namespace Indexer
             // Set up a SQL data source and indexer, and run the indexer to import book metadata from SQL DB
             Console.WriteLine("Indexing SQL DB meta data...\n");
             await CreateAndRunSQLIndexerAsync(indexName, indexerClient);
+
+            // Set up a Blob Storage data source and indexer, and run the indexer to merge book data
+            Console.WriteLine("Indexing and merging book data from blob storage...\n");
+            await CreateAndRunBlobIndexerAsync(indexName, indexerClient);
 
 
             Console.WriteLine("Complete.  Press any key to end application...\n");
@@ -116,6 +118,67 @@ namespace Indexer
             catch (RequestFailedException ex) when (ex.Status == 429)
             {
                 Console.WriteLine("Failed to run sql indexer: {0}", ex.Message);
+            }
+        }
+
+
+        private static async Task CreateAndRunBlobIndexerAsync(string indexName, SearchIndexerClient indexerClient)
+        {
+            SearchIndexerDataSourceConnection blobDataSource = new SearchIndexerDataSourceConnection(
+                name: configuration["BlobStorageAccountName"],
+                type: SearchIndexerDataSourceType.AzureBlob,
+                connectionString: configuration["BlobStorageConnectionString"],
+                container: new SearchIndexerDataContainer("gapzap-pdf-docs"));
+
+            // The blob data source does not need to be deleted if it already exists,
+            // but the connection string might need to be updated if it has changed.
+            await indexerClient.CreateOrUpdateDataSourceConnectionAsync(blobDataSource);
+
+            Console.WriteLine("Creating Blob Storage indexer...\n");
+
+            // Add a field mapping to match the Id field in the documents to 
+            // the HotelId key field in the index
+            List<FieldMapping> map = new List<FieldMapping> {
+                new FieldMapping("Id")
+                {
+                    TargetFieldName =  "HotelId"
+                }
+            };
+
+            IndexingParameters parameters = new IndexingParameters();
+            parameters.Configuration.Add("parsingMode", "json");
+
+            SearchIndexer blobIndexer = new SearchIndexer(
+                name: "hotel-rooms-blob-indexer",
+                dataSourceName: blobDataSource.Name,
+                targetIndexName: indexName)
+            {
+                Parameters = parameters,
+                Schedule = new IndexingSchedule(TimeSpan.FromDays(1))
+            };
+
+            blobIndexer.FieldMappings.Add(new FieldMapping("Id") { TargetFieldName = "HotelId" });
+
+            // Reset the indexer if it already exists
+            try
+            {
+                await indexerClient.GetIndexerAsync(blobIndexer.Name);
+                //Rest the indexer if it exsits.
+                await indexerClient.ResetIndexerAsync(blobIndexer.Name);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 404) { }
+
+            await indexerClient.CreateOrUpdateIndexerAsync(blobIndexer);
+
+            Console.WriteLine("Running Blob Storage indexer...\n");
+
+            try
+            {
+                await indexerClient.RunIndexerAsync(blobIndexer.Name);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 429)
+            {
+                Console.WriteLine("Failed to run indexer: {0}", ex.Message);
             }
         }
     }
